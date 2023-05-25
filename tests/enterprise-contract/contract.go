@@ -20,8 +20,7 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 	var err error
 	var namespace string
 	var kubeController tekton.KubeController
-	var policySource []ecp.Source
-	var policyConfig *ecp.EnterpriseContractPolicyConfiguration
+	var defaultPolicy *ecp.EnterpriseContractPolicy
 	var imageWithDigest string
 	var pipelineRunTimeout int
 	var generator tekton.VerifyEnterpriseContract
@@ -44,10 +43,9 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 		Expect(kubeController.CreateOrUpdateSigningSecret(
 			publicKey, publicSecretName, namespace)).To(Succeed())
 
-		defaultEcp, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
+		policy, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
 		Expect(err).NotTo(HaveOccurred())
-		policyConfig = defaultEcp.Spec.Configuration
-		policySource = defaultEcp.Spec.Sources
+		defaultPolicy = policy
 
 		cm, err := kubeController.Commonctrl.GetConfigMap("ec-defaults", "enterprise-contract-service")
 		Expect(err).ToNot(HaveOccurred())
@@ -57,24 +55,19 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 		imageWithDigest = "quay.io/redhat-appstudio/ec-golden-image:latest"
 	})
 	Context("ec-cli command verification", func() {
-		BeforeAll(func() {
+		BeforeEach(func() {
 			generator = tekton.VerifyEnterpriseContract{
 				Bundle:              verifyECTaskBundle,
 				Image:               imageWithDigest,
 				Name:                "verify-enterprise-contract",
 				Namespace:           namespace,
-				PolicyConfiguration: "ec-policy",
+				PolicyConfiguration: fmt.Sprintf("%s/%s", defaultPolicy.Namespace, defaultPolicy.Name),
 				PublicKey:           fmt.Sprintf("k8s://%s/%s", namespace, publicSecretName),
 				SSLCertDir:          "/var/run/secrets/kubernetes.io/serviceaccount",
 				Strict:              false,
 				EffectiveTime:       "now",
 			}
 			pipelineRunTimeout = int(time.Duration(5) * time.Minute)
-			baselinePolicies := ecp.EnterpriseContractPolicySpec{
-				Configuration: policyConfig,
-				Sources:       policySource,
-			}
-			Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, baselinePolicies)).To(Succeed())
 		})
 		It("verifies ec cli has error handling", func() {
 			generator.Image = "quay.io/redhat-appstudio/ec-golden-image:latest"
@@ -102,7 +95,7 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 	})
 
 	Context("Release Policy", func() {
-		BeforeAll(func() {
+		BeforeEach(func() {
 			secretName := fmt.Sprintf("golden-image-public-key%s", util.GenerateRandomString(10))
 			//The staging public key for verificaiton image
 			publicKey := []byte("-----BEGIN PUBLIC KEY-----\n" +
@@ -116,7 +109,7 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 				Image:               imageWithDigest,
 				Name:                "verify-enterprise-contract",
 				Namespace:           namespace,
-				PolicyConfiguration: "ec-policy",
+				PolicyConfiguration: fmt.Sprintf("%s/%s", defaultPolicy.Namespace, defaultPolicy.Name),
 				PublicKey:           fmt.Sprintf("k8s://%s/%s", namespace, secretName),
 				SSLCertDir:          "/var/run/secrets/kubernetes.io/serviceaccount",
 				Strict:              false,
@@ -125,16 +118,17 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 			pipelineRunTimeout = int(time.Duration(5) * time.Minute)
 		})
 
-		It("verifies ec validate accepts a list of image references", func() {
-			policy := ecp.EnterpriseContractPolicySpec{
-				Sources: policySource,
-				Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-					Include: []string{"minimal"},
-				},
+		It("verifies ec validate accepts a list of image references", func(ctx SpecContext) {
+			spec := *defaultPolicy.Spec.DeepCopy()
+			spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+				Include: []string{"minimal"},
 			}
-			Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, policy)).To(Succeed())
+			policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+			Expect(err).NotTo((HaveOccurred()))
 
 			generator.Image = snapshotComponent
+			generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+
 			pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(kubeController.WatchPipelineRun(pr.Name, pipelineRunTimeout)).To(Succeed())
@@ -157,16 +151,17 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 
 		})
 
-		It("verifies the release policy: Task bundle is not acceptable", func() {
-			policy := ecp.EnterpriseContractPolicySpec{
-				Sources: policySource,
-				Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-					Include: []string{"attestation_task_bundle.task_ref_bundles_acceptable"},
-				},
+		It("verifies the release policy: Task bundle is not acceptable", func(ctx SpecContext) {
+			spec := *defaultPolicy.Spec.DeepCopy()
+			spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+				Include: []string{"attestation_task_bundle.task_ref_bundles_acceptable"},
 			}
-			Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, policy)).To(Succeed())
+			policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+			Expect(err).NotTo((HaveOccurred()))
 
 			generator.Image = "quay.io/redhat-appstudio/ec-golden-image:e2e-test-unacceptable-task"
+			generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+
 			pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(kubeController.WatchPipelineRun(pr.Name, pipelineRunTimeout)).To(Succeed())
@@ -190,26 +185,28 @@ var _ = framework.EnterpriseContractSuiteDescribe("Enterprise Contract E2E tests
 			Expect(reportLog).Should(ContainSubstring("msg: Pipeline task 'build-container' uses an unacceptable task bundle"))
 		})
 
-		It("verifies the release policy: Task bundle is out of date", func() {
-			policy := ecp.EnterpriseContractPolicySpec{
-				Sources: []ecp.Source{
-					{
-						Policy: []string{
-							"oci::quay.io/hacbs-contract/ec-release-policy:git-086f871@sha256:373a5c4c1d34123836cbfc11826f6bbf6fdf8f0dfae333a2686bbe941c4f79ef",
-						},
-						Data: []string{
-							"oci::quay.io/hacbs-contract/ec-policy-data:git-8629680@sha256:ee5708dda57216647f63032dd3e63375e70e2353cb1ad10c9ab5493b9236c23e",
-						},
+		It("verifies the release policy: Task bundle is out of date", func(ctx SpecContext) {
+			spec := *defaultPolicy.Spec.DeepCopy()
+			spec.Sources = []ecp.Source{
+				{
+					Policy: []string{
+						"oci::quay.io/hacbs-contract/ec-release-policy:git-086f871@sha256:373a5c4c1d34123836cbfc11826f6bbf6fdf8f0dfae333a2686bbe941c4f79ef",
+					},
+					Data: []string{
+						"oci::quay.io/hacbs-contract/ec-policy-data:git-8629680@sha256:ee5708dda57216647f63032dd3e63375e70e2353cb1ad10c9ab5493b9236c23e",
 					},
 				},
-				Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-					Include: []string{"attestation_task_bundle.task_ref_bundles_current"},
-				},
 			}
-			Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, policy)).To(Succeed())
+			spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+				Include: []string{"attestation_task_bundle.task_ref_bundles_current"},
+			}
+			policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+			Expect(err).NotTo((HaveOccurred()))
 
 			generator.Image = "quay.io/redhat-appstudio/ec-golden-image:e2e-test-out-of-date-task"
 			generator.EffectiveTime = "2023-03-31T00:00:00Z"
+			generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+
 			pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(kubeController.WatchPipelineRun(pr.Name, pipelineRunTimeout)).To(Succeed())

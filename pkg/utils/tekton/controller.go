@@ -614,43 +614,21 @@ func (k KubeController) GetTektonChainsPublicKey() ([]byte, error) {
 	return publicKey, err
 }
 
-func (k KubeController) CreateOrUpdatePolicyConfiguration(namespace string, policy ecp.EnterpriseContractPolicySpec) error {
-	ecPolicy := ecp.EnterpriseContractPolicy{
+func (k KubeController) CreateEnterpriseContractPolicy(ctx context.Context, namespace string, spec ecp.EnterpriseContractPolicySpec) (*ecp.EnterpriseContractPolicy, error) {
+	p := &ecp.EnterpriseContractPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ec-policy",
-			Namespace: namespace,
+			GenerateName: "policy-",
+			Namespace:    namespace,
 		},
+		Spec: spec,
 	}
 
-	// fetch to see if it exists
-	err := k.Tektonctrl.KubeRest().Get(context.TODO(), crclient.ObjectKey{
-		Namespace: namespace,
-		Name:      "ec-policy",
-	}, &ecPolicy)
-
-	exists := true
-	if err != nil {
-		if errors.IsNotFound(err) {
-			exists = false
-		} else {
-			return err
-		}
+	if err := k.Tektonctrl.KubeRest().Create(ctx, p); err != nil {
+		return nil, err
 	}
 
-	ecPolicy.Spec = policy
-	if !exists {
-		// it doesn't, so create
-		if err := k.Tektonctrl.KubeRest().Create(context.TODO(), &ecPolicy); err != nil {
-			return err
-		}
-	} else {
-		// it does, so update
-		if err := k.Tektonctrl.KubeRest().Update(context.TODO(), &ecPolicy); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	g.GinkgoWriter.Printf("Created new EnterpriseContractPolicy:\n%#v\n", p)
+	return p, nil
 }
 
 func (k KubeController) GetRekorHost() (rekorHost string, err error) {

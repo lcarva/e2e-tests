@@ -248,7 +248,7 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build", "
 						Namespace:  testNamespace,
 					}
 				})
-				It("verify-enterprice-contract check should pass", Label(buildTemplatesTestLabel), func() {
+				It("verify-enterprice-contract check should pass", Label(buildTemplatesTestLabel), func(ctx SpecContext) {
 					cm, err := kubeController.Commonctrl.GetConfigMap("ec-defaults", "enterprise-contract-service")
 					Expect(err).ToNot(HaveOccurred())
 
@@ -262,20 +262,16 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build", "
 					Expect(kubeController.CreateOrUpdateSigningSecret(
 						publicKey, publicSecretName, testNamespace)).To(Succeed())
 
-					defaultEcp, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
+					defaultPolicy, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
 					Expect(err).NotTo(HaveOccurred())
 
-					policySource := defaultEcp.Spec.Sources
-					policy := ecp.EnterpriseContractPolicySpec{
-						Sources: policySource,
-						Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-							// The BuildahDemo pipeline used to generate the test data does not
-							// include the required test tasks, so this policy should always fail.
-							Collections: []string{"slsa2"},
-							Exclude:     []string{"cve"},
-						},
+					policySpec := *defaultPolicy.Spec.DeepCopy()
+					policySpec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+						Collections: []string{"slsa2"},
+						Exclude:     []string{"cve"},
 					}
-					Expect(kubeController.CreateOrUpdatePolicyConfiguration(testNamespace, policy)).To(Succeed())
+					policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, testNamespace, policySpec)
+					Expect(err).NotTo((HaveOccurred()))
 
 					generator := tekton.VerifyEnterpriseContract{
 						ApplicationName:     applicationName,
@@ -284,7 +280,7 @@ var _ = framework.BuildSuiteDescribe("Build service E2E tests", Label("build", "
 						Image:               outputImage,
 						Name:                "verify-enterprise-contract",
 						Namespace:           testNamespace,
-						PolicyConfiguration: "ec-policy",
+						PolicyConfiguration: fmt.Sprintf("%s/%s", policy.Namespace, policy.Name),
 						PublicKey:           fmt.Sprintf("k8s://%s/%s", testNamespace, publicSecretName),
 						SSLCertDir:          "/var/run/secrets/kubernetes.io/serviceaccount",
 						Strict:              true,

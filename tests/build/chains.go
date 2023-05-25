@@ -69,7 +69,7 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 		var pipelineRunTimeout int
 		var attestationTimeout time.Duration
 		var kubeController tekton.KubeController
-		var policySource []ecp.Source
+		var defaultPolicy *ecp.EnterpriseContractPolicy
 
 		BeforeAll(func() {
 			kubeController = tekton.KubeController{
@@ -102,22 +102,9 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 			pipelineRunTimeout = int(time.Duration(20) * time.Minute)
 			attestationTimeout = time.Duration(60) * time.Second
 
-			defaultEcp, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
+			policy, err := kubeController.GetEnterpriseContractPolicy("default", "enterprise-contract-service")
 			Expect(err).NotTo(HaveOccurred())
-			policySource = defaultEcp.Spec.Sources
-
-			// if there is a ConfigMap e2e-tests/ec-config with keys `revision` and
-			// `repository` values from those will replace the default policy source
-			// this gives us a way to set the tests to use a different policy if we
-			// break the tests in the default policy source
-			// if config, err := fwk.CommonController.K8sClient.KubeInterface().CoreV1().ConfigMaps("e2e-tests").Get(context.TODO(), "ec-config", v1.GetOptions{}); err != nil {
-			// 	if v, ok := config.Data["revision"]; ok {
-			// 		policySource.Revision = &v
-			// 	}
-			// 	if v, ok := config.Data["repository"]; ok {
-			// 		policySource.Repository = v
-			// 	}
-			// }
+			defaultPolicy = policy
 
 			// At a bare minimum, each spec within this context relies on the existence of
 			// an image that has been signed by Tekton Chains. Trigger a demo task to fulfill
@@ -197,28 +184,24 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 					Image:               imageWithDigest,
 					Name:                "verify-enterprise-contract",
 					Namespace:           namespace,
-					PolicyConfiguration: "ec-policy",
+					PolicyConfiguration: fmt.Sprintf("%s/%s", defaultPolicy.Namespace, defaultPolicy.Name),
 					PublicKey:           fmt.Sprintf("k8s://%s/%s", namespace, publicSecretName),
 					SSLCertDir:          "/var/run/secrets/kubernetes.io/serviceaccount",
 					Strict:              true,
 					EffectiveTime:       "now",
 				}
-
-				// Since specs could update the config policy, make sure it has a consistent
-				// baseline at the start of each spec.
-				baselinePolicies := ecp.EnterpriseContractPolicySpec{
-					Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-						// A simple policy that should always succeed in a cluster where
-						// Tekton Chains is properly setup.
-						Include: []string{"slsa_provenance_available"},
-					},
-					Sources: policySource,
-				}
-				Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, baselinePolicies)).To(Succeed())
-				// printPolicyConfiguration(baselinePolicies)
 			})
 
-			It("succeeds when policy is met", func() {
+			It("succeeds when policy is met", func(ctx SpecContext) {
+				spec := *defaultPolicy.Spec.DeepCopy()
+				spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+					Include: []string{"slsa_provenance_available"},
+				}
+				policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+				Expect(err).NotTo((HaveOccurred()))
+
+				generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+
 				pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(kubeController.WatchPipelineRun(pr.Name, pipelineRunTimeout)).To(Succeed())
@@ -240,18 +223,17 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 				))
 			})
 
-			It("does not pass when tests are not satisfied on non-strict mode", func() {
-				policy := ecp.EnterpriseContractPolicySpec{
-					Sources: policySource,
-					Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-						// The BuildahDemo pipeline used to generate the test data does not
-						// include the required test tasks, so this policy should always fail.
-						Include: []string{"test"},
-					},
+			It("does not pass when tests are not satisfied on non-strict mode", func(ctx SpecContext) {
+				spec := *defaultPolicy.Spec.DeepCopy()
+				spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+					Include: []string{"test"},
 				}
-				Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, policy)).To(Succeed())
-				// printPolicyConfiguration(policy)
+				policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+				Expect(err).NotTo((HaveOccurred()))
+
+				generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
 				generator.Strict = false
+
 				pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(kubeController.WatchPipelineRun(pr.Name, pipelineRunTimeout)).To(Succeed())
@@ -274,17 +256,15 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 				))
 			})
 
-			It("fails when tests are not satisfied on strict mode", func() {
-				policy := ecp.EnterpriseContractPolicySpec{
-					Sources: policySource,
-					Configuration: &ecp.EnterpriseContractPolicyConfiguration{
-						// The BuildahDemo pipeline used to generate the test data does not
-						// include the required test tasks, so this policy should always fail.
-						Include: []string{"test"},
-					},
+			It("fails when tests are not satisfied on strict mode", func(ctx SpecContext) {
+				spec := *defaultPolicy.Spec.DeepCopy()
+				spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+					Include: []string{"test"},
 				}
-				Expect(kubeController.CreateOrUpdatePolicyConfiguration(namespace, policy)).To(Succeed())
-				// printPolicyConfiguration(policy)
+				policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+				Expect(err).NotTo((HaveOccurred()))
+
+				generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
 
 				generator.Strict = true
 				pr, err := kubeController.RunPipeline(generator, pipelineRunTimeout)
@@ -304,7 +284,16 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 				// Because the task fails, no results are created
 			})
 
-			It("fails when unexpected signature is used", func() {
+			It("fails when unexpected signature is used", func(ctx SpecContext) {
+				spec := *defaultPolicy.Spec.DeepCopy()
+				spec.Configuration = &ecp.EnterpriseContractPolicyConfiguration{
+					Include: []string{"slsa_provenance_available"},
+				}
+				policy, err := kubeController.CreateEnterpriseContractPolicy(ctx, namespace, spec)
+				Expect(err).NotTo((HaveOccurred()))
+
+				generator.PolicyConfiguration = fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+
 				secretName := fmt.Sprintf("dummy-public-key-%s", util.GenerateRandomString(10))
 				publicKey := []byte("-----BEGIN PUBLIC KEY-----\n" +
 					"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENZxkE/d0fKvJ51dXHQmxXaRMTtVz\n" +
@@ -333,27 +322,6 @@ var _ = framework.ChainsSuiteDescribe("Tekton Chains E2E tests", Label("ec", "HA
 		})
 	})
 })
-
-// func printPolicyConfiguration(policy ecp.EnterpriseContractPolicySpec) {
-// 	sources := ""
-// 	for i, s := range policy.Sources {
-// 		if i != 0 {
-// 			sources += "\n"
-// 		}
-// 		if s.GitRepository != nil {
-// 			if s.GitRepository.Revision != nil {
-// 				sources += fmt.Sprintf("[%d] repository: '%s', revision: '%s'", i, s.GitRepository.Repository, *s.GitRepository.Revision)
-// 			} else {
-// 				sources += fmt.Sprintf("[%d] repository: '%s'", i, s.GitRepository.Repository)
-// 			}
-// 		}
-// 	}
-// 	exceptions := "[]"
-// 	if policy.Exceptions != nil {
-// 		exceptions = fmt.Sprintf("%v", policy.Exceptions.NonBlocking)
-// 	}
-// 	GinkgoWriter.Printf("Configured sources: %s\nand non-blocking policies: %v\n", sources, exceptions)
-// }
 
 func printTaskRunStatus(tr *v1beta1.PipelineRunTaskRunStatus, namespace string, sc common.SuiteController) {
 	if tr.Status == nil {
